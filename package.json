@@ -1,0 +1,17 @@
+{
+	"name": "pi-accounts-rotate",
+	"version": "0.1.0",
+	"description": "Automatic quota/rate-limit account rotation for @narumitw/pi-accounts",
+	"keywords": ["pi-package", "pi-extension"],
+	"license": "MIT",
+	"pi": {
+		"extensions": ["./extension.ts"]
+	},
+	"dependencies": {
+		"@narumitw/pi-accounts": "^0.46.0"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	}
+}
