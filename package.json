@@ -2,6 +2,20 @@
 	"name": "pi-accounts-rotate",
 	"version": "0.1.0",
 	"description": "Automatic quota/rate-limit account rotation for @narumitw/pi-accounts",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/selimerunkut/pi-accounts-rotate.git"
+	},
+	"homepage": "https://github.com/selimerunkut/pi-accounts-rotate#readme",
+	"bugs": {
+		"url": "https://github.com/selimerunkut/pi-accounts-rotate/issues"
+	},
+	"files": [
+		"README.md",
+		"extension.ts",
+		"logic.ts",
+		"state.ts"
+	],
 	"keywords": [
 		"pi-package",
 		"pi-extension"
