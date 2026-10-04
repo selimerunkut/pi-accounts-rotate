@@ -1,6 +1,6 @@
 {
 	"name": "pi-accounts-rotate",
-	"version": "0.1.0",
+	"version": "0.1.1",
 	"description": "Automatic quota/rate-limit account rotation for @narumitw/pi-accounts",
 	"repository": {
 		"type": "git",
@@ -12,6 +12,7 @@
 	},
 	"files": [
 		"README.md",
+		"changelog.md",
 		"extension.ts",
 		"logic.ts",
 		"state.ts"
@@ -21,6 +22,9 @@
 		"pi-extension"
 	],
 	"license": "MIT",
+	"scripts": {
+		"test": "bun test ./extension.test.ts ./state.test.ts ./extension.integration.test.ts && node --test ./runtime.smoke.test.mjs"
+	},
 	"pi": {
 		"extensions": [
 			"./extension.ts"

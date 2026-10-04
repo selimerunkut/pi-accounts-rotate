@@ -10,8 +10,8 @@
  *      Headless child processes skip persisted cooldowns before their first request.
  *   3. Persists it as the current session selection without changing the
  *      provider-wide default used by new sessions.
- *   4. Applies the new OAuth credential immediately, then retries after the
- *      agent settles so the normal before_agent_start lifecycle runs.
+ *   4. Applies the new OAuth credential immediately, then requests a bounded
+ *      continuation at agent_before_settle (including print/JSON mode).
  *
  * Config (optional): ~/.pi/agent/pi-accounts-rotate.json
  *   { "enabled": true, "cooldownMinutes": 5 }
@@ -29,6 +29,7 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { getAgentDir } from "@earendil-works/pi-coding-agent";
 import { AccountStore } from "@narumitw/pi-accounts/src/accounts.js";
 import { createBuiltinProviderAdapters } from "@narumitw/pi-accounts/src/oauth.js";
+import { RUNTIME_FAIL_CLOSED_API_KEY, redactTokenText } from "@narumitw/pi-accounts/src/runtime-auth.js";
 import {
 	ACCOUNT_SELECTION_ENTRY_TYPE,
 	createAccountSelectionEntryData,
@@ -149,6 +150,7 @@ function updateParentSelectionHint(ctx: ExtensionContext): void {
 async function adoptParentSelection(
 	ctx: ExtensionContext,
 	store: AccountStore,
+	allowInitialDefault = false,
 ): Promise<void> {
 	const hinted = readParentSelectionHint();
 	if (Object.keys(hinted).length === 0) return;
@@ -161,10 +163,22 @@ async function adoptParentSelection(
 		restored.status === "loaded"
 			? restored.selections
 			: (Object.create(null) as Record<string, string | null>);
+	// pi-accounts runs first and seeds a new session from the global default.
+	// Only that one startup entry may be replaced. Resumed/reloaded sessions,
+	// conversation history, and additional manual selections always win.
+	const entries = ctx.sessionManager.getEntries();
+	const initialDefault =
+		allowInitialDefault &&
+		!entries.some((entry) => entry.type === "message") &&
+		entries.filter((entry) => entry.type === "custom" && entry.customType === ACCOUNT_SELECTION_ENTRY_TYPE).length === 1;
 	let changed = false;
 	for (const [providerId, accountName] of Object.entries(hinted)) {
 		const state = await store.readProviderAsync(providerId as never);
 		if (!Object.hasOwn(state.accounts, accountName)) continue;
+		if (
+			Object.hasOwn(selections, providerId) &&
+			!(initialDefault && selections[providerId] !== null && selections[providerId] === state.active)
+		) continue;
 		if (selections[providerId] === accountName) continue;
 		selections = setAccountSelection(selections, providerId, accountName);
 		changed = true;
@@ -223,46 +237,81 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 	const adapters = new Map(
 		createBuiltinProviderAdapters().map((adapter) => [adapter.id, adapter] as const),
 	);
-	// Runtime OAuth keys are cached per provider so they can be applied even
-	// when a retry bypasses before_agent_start. The main pi-accounts overlay
-	// remains the owner of provider configuration.
-	const runtimeApiKeys = new Map<RotateProviderId, string>();
+	type AppliedAuth = {
+		sessionId: string;
+		providerId: RotateProviderId;
+		accountName: string;
+		apiKey: string;
+	};
+	const appliedAuth = new WeakMap<ExtensionContext["sessionManager"], AppliedAuth>();
+	// Attribute failures to the credential prepared for the request, not to
+	// a selection that might have changed while that request was running.
+	const requestedAccounts = new WeakMap<ExtensionContext["sessionManager"], AppliedAuth>();
 	// Per-prompt cascade state prevents retry loops across rotations.
-	let cascade: { prompt: string; attempted: Set<string> } | undefined;
-	let lastPrompt: string | undefined;
-	// A retry is sent after agent_settled so it starts a fresh prompt lifecycle.
-	// This is important because a steer continuation skips before_agent_start.
-	let pendingRetry: string | undefined;
+	let cascade: { attempted: Set<string> } | undefined;
+	// Continue the existing run before settlement; do not resend the user prompt
+	// from a timer after print/JSON mode has already decided to exit.
+	let pendingRetry = false;
 
 	async function refreshSelectedAuth(
 		ctx: ExtensionContext,
 		providerId: RotateProviderId,
-	): Promise<void> {
+	): Promise<AppliedAuth | undefined> {
 		if (!ctx.modelRegistry) return;
+		const registry = ctx.modelRegistry as typeof ctx.modelRegistry & {
+			runtime?: {
+				setRuntimeApiKey(provider: string, apiKey: string): void | Promise<void>;
+				removeRuntimeApiKey(provider: string): void | Promise<void>;
+			};
+			getApiKeyForProvider?: (provider: string) => Promise<string | undefined>;
+		};
+		const runtime = registry.runtime;
+		if (!runtime) throw new Error("Pi does not expose runtime provider authentication");
+		const state = await store.readProviderAsync(providerId as never);
 		const selected = selectedSessionAccount(ctx, providerId);
-		if (selected === undefined || selected === null) {
-			const runtime = (ctx.modelRegistry as typeof ctx.modelRegistry & {
-				runtime?: { removeRuntimeApiKey(provider: string): void | Promise<void> };
-			}).runtime;
-			if (runtime && runtimeApiKeys.has(providerId)) {
-				await runtime.removeRuntimeApiKey(providerId);
-			}
-			runtimeApiKeys.delete(providerId);
-			return;
+		const accountName = selected === undefined ? state.active : selected;
+		const sessionId = ctx.sessionManager.getSessionId();
+		if (accountName === undefined || accountName === null) {
+			await runtime.removeRuntimeApiKey(providerId);
+			appliedAuth.delete(ctx.sessionManager);
+			return { sessionId, providerId, accountName: "default", apiKey: "" };
 		}
 		const adapter = adapters.get(providerId);
-		if (!adapter) return;
-		const state = await store.readProviderAsync(providerId as never);
-		const credential = state.accounts[selected];
-		if (!credential) throw new Error(`account "${selected}" was not found`);
-		const auth = await adapter.oauth.toAuth(credential);
-		if (!auth.apiKey) throw new Error("OAuth provider returned no API key");
-		const runtime = (ctx.modelRegistry as typeof ctx.modelRegistry & {
-			runtime?: { setRuntimeApiKey(provider: string, apiKey: string): void | Promise<void> };
-		}).runtime;
-		if (!runtime) throw new Error("Pi does not expose runtime provider authentication");
-		await runtime.setRuntimeApiKey(providerId, auth.apiKey);
-		runtimeApiKeys.set(providerId, auth.apiKey);
+		if (!adapter) throw new Error(`OAuth provider ${providerId} is unavailable`);
+		let credential = state.accounts[accountName];
+		if (!credential) throw new Error(`account "${accountName}" was not found`);
+		try {
+			// Use AccountStore's locked update so another process's refresh is
+			// reused instead of consuming the same refresh token twice.
+			if (credential.expires <= Date.now() + 5 * 60_000) {
+				const updated = await store.updateProviderAsync(providerId as never, async (latest) => {
+					const current = latest.accounts[accountName];
+					if (!current) throw new Error(`account "${accountName}" was removed`);
+					if (current.expires > Date.now() + 5 * 60_000) return latest;
+					const refreshed = await adapter.oauth.refresh(current, ctx.signal);
+					return { ...latest, accounts: { ...latest.accounts, [accountName]: refreshed } };
+				});
+				credential = updated.accounts[accountName];
+			}
+			const auth = await adapter.oauth.toAuth(credential);
+			if (!auth.apiKey) throw new Error("OAuth provider returned no API key");
+			const previous = appliedAuth.get(ctx.sessionManager);
+			if (
+				!previous || previous.sessionId !== sessionId ||
+				previous.providerId !== providerId || previous.apiKey !== auth.apiKey
+			) {
+				await adapter.invalidateConnections?.(sessionId);
+			}
+			await runtime.setRuntimeApiKey(providerId, auth.apiKey);
+			if (registry.getApiKeyForProvider && await registry.getApiKeyForProvider(providerId) !== auth.apiKey) {
+				throw new Error("Pi did not retain the selected account credential");
+			}
+			const applied = { sessionId, providerId, accountName, apiKey: auth.apiKey };
+			appliedAuth.set(ctx.sessionManager, applied);
+			return applied;
+		} catch (error) {
+			throw new Error(redactTokenText(errorMessage(error), [credential.access, credential.refresh]));
+		}
 	}
 
 	function readExhausted(now = Date.now()): RotationState {
@@ -305,10 +354,8 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 	/**
 	 * Skip an account that another Pi process already found exhausted.
 	 *
-	 * Reactive rotation alone cannot help a headless child: it sends one request,
-	 * so the failure is discovered only after that request was already spent, and
-	 * the queued retry dies with the process. Choosing a usable account before the
-	 * first request is what makes rotation work for `pi --print` callers.
+	 * Avoid wasting the first request on an account that is already cooling down,
+	 * including when a fresh print/JSON child inherits that account.
 	 */
 	async function avoidExhaustedAccount(
 		ctx: ExtensionContext,
@@ -335,7 +382,6 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		if (decision.kind !== "rotate") return;
 		persistSessionSelection(ctx, providerId, decision.next);
 		updateParentSelectionHint(ctx);
-		await adapters.get(providerId)?.invalidateConnections?.(ctx.sessionManager.getSessionId());
 		ctx.ui.setStatus(STATUS_KEY, `${providerId}: ${current}→${decision.next} (cooling down)`);
 		notify(
 			ctx,
@@ -344,18 +390,22 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		);
 	}
 
-	pi.on("before_agent_start", (event) => {
-		lastPrompt = event.prompt;
-		if (!cascade || cascade.prompt !== event.prompt) {
-			cascade = { prompt: event.prompt, attempted: new Set() };
-		}
+	pi.on("before_agent_start", () => {
+		// A user submission starts a new cascade even if its text is identical.
+		// Internal boundary continuations skip this hook and retain the bound.
+		cascade = { attempted: new Set() };
+		pendingRetry = false;
 	});
 
 	// Refresh after pi-accounts' handler so this extension sees the current
 	// session selection, including a selection changed by another extension.
-	pi.on("session_start", async (_event, ctx) => {
+	pi.on("session_start", async (event, ctx) => {
+		cascade = undefined;
+		pendingRetry = false;
+		appliedAuth.delete(ctx.sessionManager);
+		requestedAccounts.delete(ctx.sessionManager);
 		try {
-			await adoptParentSelection(ctx, store);
+			await adoptParentSelection(ctx, store, event.reason === "startup" || event.reason === "new");
 			updateParentSelectionHint(ctx);
 		} catch (error) {
 			ctx.ui.notify(
@@ -378,7 +428,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		}
 		if (!providerId) return;
 		try {
-			// Must run before the request is spent: a headless child gets exactly one.
+			// Skip known cooldowns before spending the first request.
 			if (config.enabled) await avoidExhaustedAccount(ctx, providerId);
 			await refreshSelectedAuth(ctx, providerId);
 		} catch (error) {
@@ -390,37 +440,50 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		}
 	});
 
-	// Host-level retries can skip the agent lifecycle. Re-apply the selected
-	// runtime key at the last hook before the provider request as well.
-	pi.on("before_provider_headers", async (_event, ctx) => {
+	// Continuations/retries may skip before_agent_start. turn_start runs before
+	// the provider resolves authentication; the header hook is too late to
+	// change a credential already captured by that request.
+	pi.on("turn_start", async (_event, ctx) => {
 		const providerId = toProviderId(ctx.model?.provider);
-		const runtimeApiKey = providerId ? runtimeApiKeys.get(providerId) : undefined;
-		if (!providerId || !runtimeApiKey) return;
-		const runtime = (ctx.modelRegistry as typeof ctx.modelRegistry & {
-			runtime?: { setRuntimeApiKey(provider: string, apiKey: string): void | Promise<void> };
-		}).runtime;
-		await runtime?.setRuntimeApiKey(providerId, runtimeApiKey);
+		if (!providerId) return;
+		requestedAccounts.delete(ctx.sessionManager);
+		try {
+			const applied = await refreshSelectedAuth(ctx, providerId);
+			if (applied) requestedAccounts.set(ctx.sessionManager, applied);
+		} catch (error) {
+			appliedAuth.delete(ctx.sessionManager);
+			pendingRetry = false;
+			try {
+				await ctx.modelRegistry.runtime.setRuntimeApiKey(providerId, RUNTIME_FAIL_CLOSED_API_KEY);
+			} finally {
+				ctx.abort();
+			}
+			notify(ctx, `[accounts-rotate] could not prepare ${providerId}; request aborted: ${redactTokenText(errorMessage(error))}`, "error");
+		}
 	});
 
-	// Do not queue a steer from agent_end. Steer continuations bypass
-	// before_agent_start and Pi's built-in retry may run before the session is
-	// idle. A settled retry starts a normal prompt lifecycle instead.
-	pi.on("agent_settled", () => {
-		const prompt = pendingRetry;
-		pendingRetry = undefined;
-		if (!prompt) return;
-		setTimeout(() => {
-			try {
-				pi.sendUserMessage(prompt);
-			} catch (error) {
-				// Headless/print runs and session reloads can leave the captured
-				// ctx stale before this timer fires. Dropping the queued retry
-				// is correct there; crashing the host process is not.
-				if (!errorMessage(error).includes("stale after session replacement")) {
-					console.error(`[accounts-rotate] queued retry failed: ${errorMessage(error)}`);
-				}
-			}
-		}, 0);
+	pi.on("agent_before_settle", (event, ctx) => {
+		const retry = pendingRetry;
+		pendingRetry = false;
+		if (!retry || event.outcome !== "error") return;
+		if (event.context.canContinue) return { continue: true };
+		const failed = [...ctx.sessionManager.getBranch()].reverse().find(
+			(entry) => entry.type === "message" && entry.message.role === "assistant",
+		);
+		if (
+			failed?.type !== "message" || failed.message.role !== "assistant" ||
+			failed.message.stopReason !== "error" || !isRateLimitError(failed.message.errorMessage ?? "")
+		) return;
+		// Keep the original error in the audit log, but omit it from model
+		// context so Pi can continue the original prompt without duplicating it.
+		return { entries: [{ type: "context_edit" as const, targetId: failed.id, replacement: null }], continue: true };
+	});
+
+	pi.on("session_shutdown", (_event, ctx) => {
+		pendingRetry = false;
+		cascade = undefined;
+		appliedAuth.delete(ctx.sessionManager);
+		requestedAccounts.delete(ctx.sessionManager);
 	});
 
 	pi.on("agent_end", async (event, ctx) => {
@@ -430,7 +493,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		// A run that finished without an error resets the rotation cascade.
 		if (last && last.role === "assistant" && last.stopReason !== "error") {
 			cascade = undefined;
-			pendingRetry = undefined;
+			pendingRetry = false;
 		}
 		if (!config.enabled) return;
 		const failure = getLastAssistantError(event.messages);
@@ -452,8 +515,11 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		// session's selection, so never rotate from the global default when a
 		// session selection is available.
 		const sessionAccount = selectedSessionAccount(ctx, providerId);
-		const failed =
-			sessionAccount === undefined ? (state.active ?? "default") : (sessionAccount ?? "default");
+		const current = sessionAccount === undefined ? (state.active ?? "default") : (sessionAccount ?? "default");
+		const requested = requestedAccounts.get(ctx.sessionManager);
+		const failed = requested?.sessionId === ctx.sessionManager.getSessionId() && requested.providerId === providerId
+			? requested.accountName : current;
+		requestedAccounts.delete(ctx.sessionManager);
 		const now = Date.now();
 		const cooldownMs = config.cooldownMinutes * 60_000;
 		// Persisted, not in-memory: headless children exit right after this handler,
@@ -462,6 +528,12 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 			notify(ctx, `[accounts-rotate] could not persist the ${providerId} cooldown for "${failed}".`, "warning");
 		}
 		cascade?.attempted.add(failed);
+		// Never overwrite a selection changed while the failed request ran.
+		if (current !== failed) {
+			pendingRetry = false;
+			notify(ctx, `[accounts-rotate] ${providerId}: "${failed}" hit a limit; keeping your newer selection "${current}".`, "info");
+			return;
+		}
 
 		const exhaustedUntil = providerExhaustions(readExhausted(now), providerId, now);
 		const decision = pickNextAccount({
@@ -473,7 +545,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		});
 		if (decision.kind !== "rotate") {
 			// There is no useful fresh retry once every account has been tried.
-			pendingRetry = undefined;
+			pendingRetry = false;
 			const eta =
 				decision.kind === "exhausted" && decision.earliestAvailableAt !== undefined
 					? `; first account available in ${formatMinutesRemaining(decision.earliestAvailableAt, now)}`
@@ -491,7 +563,6 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 			// session account. Rotation must remain session-scoped.
 			persistSessionSelection(ctx, providerId, decision.next);
 			updateParentSelectionHint(ctx);
-			await adapters.get(providerId)?.invalidateConnections?.(ctx.sessionManager.getSessionId());
 			// Prepare the new credential before any host-level retry can run.
 			await refreshSelectedAuth(ctx, providerId);
 		} catch (error) {
@@ -503,7 +574,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 			return;
 		}
 		cascade?.attempted.add(decision.next);
-		pendingRetry = lastPrompt;
+		pendingRetry = true;
 		ctx.ui.setStatus(STATUS_KEY, `${providerId}: ${failed}→${decision.next}`);
 		notify(
 			ctx,
