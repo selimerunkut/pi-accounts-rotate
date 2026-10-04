@@ -304,6 +304,24 @@ describe("accountsRotate extension", () => {
 		expect(fake.sent).toEqual([]);
 	});
 
+	test("falls back to another account when the selected account was removed", async () => {
+		writeAccountsFile("openai-codex", undefined, ["b", "c"]);
+		const { default: accountsRotateExtension } = await import("./extension.ts");
+		const fake = createFakePi();
+		accountsRotateExtension(fake.pi as never);
+
+		const run = createAuthCtx();
+		selectAccount(run, "s.erunkut");
+		await fake.emit("before_agent_start", { prompt: "hello" }, run.ctx);
+
+		expect(readSelected(run, "openai-codex")).toBe("b");
+		expect(run.apiKeys.get("openai-codex")).toBe("access-b");
+		expect(run.notifications.some((n: { message: string }) =>
+			n.message.includes("was removed") && n.message.includes('"b"'),
+		)).toBe(true);
+		expect(fake.sent).toEqual([]);
+	});
+
 	test("propagates the current session account to a new child session", async () => {
 		writeAccountsFile("openai-codex", "c", ["a", "b", "c"]);
 		const { default: accountsRotateExtension } = await import("./extension.ts");

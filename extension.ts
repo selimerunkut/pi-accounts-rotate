@@ -269,7 +269,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		if (!runtime) throw new Error("Pi does not expose runtime provider authentication");
 		const state = await store.readProviderAsync(providerId as never);
 		const selected = selectedSessionAccount(ctx, providerId);
-		const accountName = selected === undefined ? state.active : selected;
+		let accountName = selected === undefined ? state.active : selected;
 		const sessionId = ctx.sessionManager.getSessionId();
 		if (accountName === undefined || accountName === null) {
 			await runtime.removeRuntimeApiKey(providerId);
@@ -279,19 +279,59 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		const adapter = adapters.get(providerId);
 		if (!adapter) throw new Error(`OAuth provider ${providerId} is unavailable`);
 		let credential = state.accounts[accountName];
-		if (!credential) throw new Error(`account "${accountName}" was not found`);
+		if (!credential) {
+			// The session's selected (or provider-active) account was removed.
+			// Fall back to another available account instead of failing the request.
+			const names = Object.keys(state.accounts).sort();
+			if (names.length === 0) {
+				notify(
+					ctx,
+					`[accounts-rotate] ${providerId}: selected account "${accountName}" was removed and no accounts remain; using the default login.`,
+					"warning",
+				);
+				await runtime.removeRuntimeApiKey(providerId);
+				appliedAuth.delete(ctx.sessionManager);
+				return { sessionId, providerId, accountName: "default", apiKey: "" };
+			}
+			const now = Date.now();
+			const decision = pickNextAccount({
+				names,
+				failed: accountName,
+				exhaustedUntil: providerExhaustions(readExhausted(now), providerId, now),
+				attempted: cascade?.attempted ?? new Set(),
+				now,
+			});
+			if (decision.kind !== "rotate") {
+				throw new Error(
+					`account "${accountName}" was not found and no other ${providerId} account is available` +
+						(decision.kind === "exhausted" && decision.earliestAvailableAt !== undefined
+							? `; first account available in ${formatMinutesRemaining(decision.earliestAvailableAt, now)}`
+							: ""),
+				);
+			}
+			accountName = decision.next;
+			credential = state.accounts[accountName];
+			persistSessionSelection(ctx, providerId, accountName);
+			updateParentSelectionHint(ctx);
+			notify(
+				ctx,
+				`[accounts-rotate] ${providerId}: selected account was removed → using "${accountName}".`,
+				"info",
+			);
+		}
+		const resolvedAccountName = accountName;
 		try {
 			// Use AccountStore's locked update so another process's refresh is
 			// reused instead of consuming the same refresh token twice.
 			if (credential.expires <= Date.now() + 5 * 60_000) {
 				const updated = await store.updateProviderAsync(providerId as never, async (latest) => {
-					const current = latest.accounts[accountName];
-					if (!current) throw new Error(`account "${accountName}" was removed`);
+					const current = latest.accounts[resolvedAccountName];
+					if (!current) throw new Error(`account "${resolvedAccountName}" was removed`);
 					if (current.expires > Date.now() + 5 * 60_000) return latest;
 					const refreshed = await adapter.oauth.refresh(current, ctx.signal);
-					return { ...latest, accounts: { ...latest.accounts, [accountName]: refreshed } };
+					return { ...latest, accounts: { ...latest.accounts, [resolvedAccountName]: refreshed } };
 				});
-				credential = updated.accounts[accountName];
+				credential = updated.accounts[resolvedAccountName];
 			}
 			const auth = await adapter.oauth.toAuth(credential);
 			if (!auth.apiKey) throw new Error("OAuth provider returned no API key");
