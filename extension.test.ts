@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test";
 import {
 	DEFAULT_CONFIG,
+	isAuthError,
 	isRateLimitError,
+	isRotatableError,
 	parseConfig,
 	pickNextAccount,
 } from "./logic.ts";
@@ -23,6 +25,32 @@ describe("isRateLimitError", () => {
 		expect(isRateLimitError("context length exceeded")).toBe(false);
 		expect(isRateLimitError("pi-accounts-auth-failed")).toBe(false);
 		expect(isRateLimitError("network timeout")).toBe(false);
+	});
+});
+
+describe("isAuthError", () => {
+	test("matches credential-invalidation phrasing", () => {
+		expect(isAuthError("Your authentication token has been invalidated. Please try signing in again.")).toBe(true);
+		expect(isAuthError("invalid_grant: token expired or revoked")).toBe(true);
+		expect(isAuthError("Session expired, please sign in again")).toBe(true);
+		expect(isAuthError("HTTP 401 Unauthorized")).toBe(true);
+		expect(isAuthError("Request failed with status code 401")).toBe(true);
+		expect(isAuthError("request failed (401): session revoked")).toBe(true);
+	});
+
+	test("ignores unrelated errors", () => {
+		expect(isAuthError("Rate limit reached for model")).toBe(false);
+		expect(isAuthError("authentication failed")).toBe(false);
+		expect(isAuthError("context length exceeded")).toBe(false);
+		expect(isAuthError("network timeout")).toBe(false);
+		expect(isAuthError("failed after 4010 tokens")).toBe(false);
+		expect(isAuthError("error code 4012 rejected the request")).toBe(false);
+	});
+
+	test("isRotatableError covers both classes", () => {
+		expect(isRotatableError("429 Too Many Requests")).toBe(true);
+		expect(isRotatableError("Your authentication token has been invalidated")).toBe(true);
+		expect(isRotatableError("network timeout")).toBe(false);
 	});
 });
 

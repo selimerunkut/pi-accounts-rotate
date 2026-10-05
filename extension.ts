@@ -2,7 +2,8 @@
  * pi-accounts-rotate — automatic quota/rate-limit account rotation for
  * @narumitw/pi-accounts (approach modeled on hjanuschka/pi-multi-pass pools).
  *
- * When an agent run ends in a rate-limit/quota-style error, this extension:
+ * When an agent run ends in a rate-limit/quota or credential-invalidation
+ * (auth) error, this extension:
  *   1. Marks the current session account for the provider as exhausted
  *      (shared on-disk cooldown, default 5 minutes).
  *   2. Picks the next eligible named account (round-robin, skipping accounts
@@ -42,7 +43,8 @@ import {
 	DEFAULT_CONFIG,
 	formatMinutesRemaining,
 	getLastAssistantError,
-	isRateLimitError,
+	isAuthError,
+	isRotatableError,
 	parseConfig,
 	pickNextAccount,
 } from "./logic.js";
@@ -256,7 +258,9 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 	async function refreshSelectedAuth(
 		ctx: ExtensionContext,
 		providerId: RotateProviderId,
+		options?: { forceRefresh?: boolean },
 	): Promise<AppliedAuth | undefined> {
+		const forceRefresh = options?.forceRefresh === true;
 		if (!ctx.modelRegistry) return;
 		const registry = ctx.modelRegistry as typeof ctx.modelRegistry & {
 			runtime?: {
@@ -323,11 +327,18 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		try {
 			// Use AccountStore's locked update so another process's refresh is
 			// reused instead of consuming the same refresh token twice.
-			if (credential.expires <= Date.now() + 5 * 60_000) {
+			if (forceRefresh || credential.expires <= Date.now() + 5 * 60_000) {
+					const priorRefresh = credential.refresh;
 				const updated = await store.updateProviderAsync(providerId as never, async (latest) => {
 					const current = latest.accounts[resolvedAccountName];
 					if (!current) throw new Error(`account "${resolvedAccountName}" was removed`);
-					if (current.expires > Date.now() + 5 * 60_000) return latest;
+					// A different refresh token means another process refreshed this
+					// credential while this process waited for the store lock. Reuse
+					// the newer credential instead of consuming another refresh token
+					// on top of it (which would revoke the token that process holds).
+					const changed = current.refresh !== priorRefresh;
+					const fresh = current.expires > Date.now() + 5 * 60_000;
+					if (fresh && (changed || !forceRefresh)) return latest;
 					const refreshed = await adapter.oauth.refresh(current, ctx.signal);
 					return { ...latest, accounts: { ...latest.accounts, [resolvedAccountName]: refreshed } };
 				});
@@ -512,7 +523,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		);
 		if (
 			failed?.type !== "message" || failed.message.role !== "assistant" ||
-			failed.message.stopReason !== "error" || !isRateLimitError(failed.message.errorMessage ?? "")
+			failed.message.stopReason !== "error" || !isRotatableError(failed.message.errorMessage ?? "")
 		) return;
 		// Keep the original error in the audit log, but omit it from model
 		// context so Pi can continue the original prompt without duplicating it.
@@ -537,7 +548,11 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 		}
 		if (!config.enabled) return;
 		const failure = getLastAssistantError(event.messages);
-		if (!failure || !isRateLimitError(failure)) return;
+		if (!failure || !isRotatableError(failure)) return;
+		// Server-invalidated credentials stay broken until the stored token is
+		// refreshed, so the newly selected account gets a forced refresh even if
+		// its locally cached token is not expired yet.
+		const forceRefresh = isAuthError(failure);
 		const providerId = toProviderId(ctx.model?.provider);
 		if (!providerId) return;
 
@@ -604,7 +619,7 @@ export default function accountsRotateExtension(pi: ExtensionAPI): void {
 			persistSessionSelection(ctx, providerId, decision.next);
 			updateParentSelectionHint(ctx);
 			// Prepare the new credential before any host-level retry can run.
-			await refreshSelectedAuth(ctx, providerId);
+			await refreshSelectedAuth(ctx, providerId, { forceRefresh });
 		} catch (error) {
 			notify(
 				ctx,

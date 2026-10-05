@@ -9,7 +9,45 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
+import { AccountStore as RealAccountStore } from "@narumitw/pi-accounts/src/account-store.js";
 let agentDir = "";
+
+// When set to an account name, the next store update first simulates another
+// Pi process refreshing that account's credential (fresh tokens, same shape),
+// then runs the extension's callback against the already-updated state. Used
+// to prove a forced refresh reuses the intervening credential instead of
+// consuming another refresh token on top of it.
+let concurrentRefreshAccount: string | undefined;
+
+class RacyAccountStore extends RealAccountStore {
+	override async updateProviderAsync(providerId: any, mutator: any, signal?: any): Promise<any> {
+		const target = concurrentRefreshAccount;
+		if (target) {
+			concurrentRefreshAccount = undefined;
+			await super.updateProviderAsync(providerId, async (latest: any) => {
+				const current = latest.accounts[target];
+				if (!current) return latest;
+				return {
+					...latest,
+					accounts: {
+						...latest.accounts,
+						[target]: {
+							...current,
+							access: `access-${target}-concurrent`,
+							refresh: `refresh-${target}-concurrent`,
+							expires: Date.now() + 86_400_000,
+						},
+					},
+				};
+			}, signal);
+		}
+		return super.updateProviderAsync(providerId, mutator, signal);
+	}
+}
+
+mock.module("@narumitw/pi-accounts/src/accounts.js", () => ({
+	AccountStore: RacyAccountStore,
+}));
 
 mock.module("@earendil-works/pi-coding-agent", () => ({
 	getAgentDir: () => agentDir,
@@ -234,6 +272,43 @@ describe("accountsRotate extension", () => {
 		expect(fake.continuations).toBe(1);
 		expect(fake.sent).toEqual([]);
 		expect(notifications.some((n) => n.message.includes('switched to "b"'))).toBe(true);
+	});
+
+	test("reuses a credential another process refreshed while force-refreshing after an auth error", async () => {
+		const accountsPath = writeAccountsFile("openai-codex", "a", ["a", "b"]);
+		const { default: accountsRotateExtension } = await import("./extension.ts");
+		const fake = createFakePi();
+		accountsRotateExtension(fake.pi as never);
+
+		const run = createAuthCtx();
+		await fake.emit("before_agent_start", { prompt: "write the report" }, run.ctx);
+
+		// The auth error rotates a → b with a forced refresh. While this process
+		// waits for the store lock, "another process" refreshes b's credential.
+		concurrentRefreshAccount = "b";
+		await fake.emit(
+			"agent_end",
+			{
+				messages: [
+					{ role: "user" },
+					{ role: "assistant", stopReason: "error", errorMessage: "Your authentication token has been invalidated. Please try signing in again." },
+				],
+			},
+			run.ctx,
+		);
+		await new Promise((resolve) => setTimeout(resolve, 0));
+
+		expect(run.entries.at(-1)?.data.providers["openai-codex"]).toBe("b");
+		// The intervening credential must be reused, not refreshed again: no
+		// oauth.refresh call, the applied key is the other process's token, and
+		// the other process's refresh token stays intact on disk.
+		expect(refreshCalls).toEqual([]);
+		expect(run.apiKeys.get("openai-codex")).toBe("access-b-concurrent");
+		const stored = JSON.parse(readFileSync(accountsPath, "utf8")) as {
+			providers: { "openai-codex": { accounts: Record<string, { refresh: string }> } };
+		};
+		expect(stored.providers["openai-codex"].accounts["b"].refresh).toBe("refresh-b-concurrent");
+		expect(fake.continuations).toBe(1);
 	});
 
 	test("does not rotate on non-rate-limit errors", async () => {

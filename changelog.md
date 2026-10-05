@@ -5,6 +5,25 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.3] - 2026-10-05
+
+### Added
+
+- Rotate to the next named account on credential-invalidation errors
+  ("authentication token has been invalidated", `invalid_grant`,
+  "please sign in again", 401/Unauthorized), not only on rate-limit/quota
+  errors. These errors previously ended the turn even when other accounts
+  were available, because a locally unexpired but server-revoked token never
+  triggers pi-accounts' normal refresh.
+- Force-refresh the newly selected account's OAuth credential after an
+  auth-invalidation failure, since its locally cached token may be
+  server-revoked but not yet locally expired. If another process refreshed
+  the credential while this process waited for the store lock, the newer
+  credential is reused instead of consuming another refresh token.
+- Narrowed the auth-error 401 match to explicit HTTP status phrasing
+  ("status code 401", "HTTP 401 Unauthorized", "(401)") so version numbers
+  or counts containing 401 cannot trigger rotation.
+
 ## [0.1.2] - 2026-10-04
 
 ### Fixed
@@ -69,6 +88,8 @@ and versions follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   proactive avoidance of cooling-down accounts in headless children.
 - `/rotate` status, enable/disable, and cooldown-reset commands.
 
-[Unreleased]: https://github.com/selimerunkut/pi-accounts-rotate/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/selimerunkut/pi-accounts-rotate/compare/v0.1.2...HEAD
+[0.1.3]: https://github.com/selimerunkut/pi-accounts-rotate/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/selimerunkut/pi-accounts-rotate/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/selimerunkut/pi-accounts-rotate/compare/5530653...v0.1.1
 [0.1.0]: https://github.com/selimerunkut/pi-accounts-rotate/tree/5530653

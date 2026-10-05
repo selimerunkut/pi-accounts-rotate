@@ -22,6 +22,30 @@ export function isRateLimitError(errorMessage: string): boolean {
 	return RATE_LIMIT_PATTERNS.some((pattern) => pattern.test(errorMessage));
 }
 
+// Server-side credential invalidation that a locally stored, unexpired token
+// cannot recover from. Switching accounts (or force-refreshing one) is the only
+// remedy, so these failures must trigger rotation like rate limits do.
+const AUTH_INVALIDATION_PATTERNS = [
+	/token has been invalidated/i,
+	/invalid_grant/i,
+	/please (?:try )?sign(?:ing)? in again/i,
+	// Bare "401" is too generic (version numbers, counts), so only match
+	// explicit HTTP status phrasing.
+	/status(?:\s*code)?\s*[:=]?\s*401\b/i,
+	/\b401\s+unauthorized\b/i,
+	/\(401\)/,
+	/\bunauthorized\b/i,
+];
+
+export function isAuthError(errorMessage: string): boolean {
+	return AUTH_INVALIDATION_PATTERNS.some((pattern) => pattern.test(errorMessage));
+}
+
+/** Any assistant-turn failure that justifies trying the next account. */
+export function isRotatableError(errorMessage: string): boolean {
+	return isRateLimitError(errorMessage) || isAuthError(errorMessage);
+}
+
 export type RotateConfig = {
 	enabled: boolean;
 	cooldownMinutes: number;
